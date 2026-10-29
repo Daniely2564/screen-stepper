@@ -45,6 +45,7 @@ from tkinter import filedialog, ttk
 
 import mss
 import mss.tools
+from mss.screenshot import ScreenShot
 
 MSS = getattr(mss, "MSS", None) or mss.mss  # mss >= 10 renamed the class
 import pywinctl
@@ -130,6 +131,93 @@ def window_bounds(win):
             pass
     box = win.box
     return int(box.left), int(box.top), int(box.width), int(box.height)
+
+
+if IS_WIN:
+    PW_RENDERFULLCONTENT = 0x2  # Windows 8.1+: also renders GPU-drawn content
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    # Our own DLL handles, so these signatures don't clash with mss/pywinctl.
+    _user32 = ctypes.WinDLL("user32")
+    _gdi32 = ctypes.WinDLL("gdi32")
+    for _dll, _name, _res, _args in (
+            (_user32, "GetDC", wintypes.HDC, [wintypes.HWND]),
+            (_user32, "ReleaseDC", ctypes.c_int, [wintypes.HWND, wintypes.HDC]),
+            (_user32, "IsIconic", wintypes.BOOL, [wintypes.HWND]),
+            (_user32, "GetWindowRect", wintypes.BOOL,
+             [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]),
+            (_user32, "PrintWindow", wintypes.BOOL, [wintypes.HWND, wintypes.HDC, wintypes.UINT]),
+            (_gdi32, "CreateCompatibleDC", wintypes.HDC, [wintypes.HDC]),
+            (_gdi32, "CreateCompatibleBitmap", wintypes.HBITMAP,
+             [wintypes.HDC, ctypes.c_int, ctypes.c_int]),
+            (_gdi32, "SelectObject", wintypes.HGDIOBJ, [wintypes.HDC, wintypes.HGDIOBJ]),
+            (_gdi32, "GetDIBits", ctypes.c_int,
+             [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+              ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT]),
+            (_gdi32, "DeleteObject", wintypes.BOOL, [wintypes.HGDIOBJ]),
+            (_gdi32, "DeleteDC", wintypes.BOOL, [wintypes.HDC])):
+        _fn = getattr(_dll, _name)
+        _fn.restype, _fn.argtypes = _res, _args
+
+
+def grab_window(win):
+    """The window's own pixels, even where other windows cover it (Windows only).
+
+    Grabbing the screen captures whatever happens to be on top of the window at
+    that moment; asking the window to render itself doesn't. Returns None when
+    Windows can't render it this way, so the caller can grab the screen instead.
+    """
+    hwnd = win.getHandle()
+    if _user32.IsIconic(hwnd):
+        return None
+    rect = wintypes.RECT()
+    if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    full_w, full_h = rect.right - rect.left, rect.bottom - rect.top
+    # PrintWindow draws the whole window rect, invisible resize borders
+    # included; keep only the part you actually see.
+    left, top, width, height = window_bounds(win)
+    x, y = max(left - rect.left, 0), max(top - rect.top, 0)
+    width, height = min(width, full_w - x), min(height, full_h - y)
+    if width < 2 or height < 2:
+        return None
+
+    screen_dc = _user32.GetDC(None)
+    mem_dc = _gdi32.CreateCompatibleDC(screen_dc)
+    bitmap = _gdi32.CreateCompatibleBitmap(screen_dc, full_w, full_h)
+    try:
+        old = _gdi32.SelectObject(mem_dc, bitmap)
+        ok = _user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT)
+        _gdi32.SelectObject(mem_dc, old)  # GetDIBits needs it deselected
+        if not ok:
+            return None
+        info = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=full_w,
+                                biHeight=-full_h,  # negative = rows top to bottom
+                                biPlanes=1, biBitCount=32)
+        buf = ctypes.create_string_buffer(full_w * full_h * 4)
+        if _gdi32.GetDIBits(mem_dc, bitmap, 0, full_h, buf, ctypes.byref(info), 0) != full_h:
+            return None
+    finally:
+        _gdi32.DeleteObject(bitmap)
+        _gdi32.DeleteDC(mem_dc)
+        _user32.ReleaseDC(None, screen_dc)
+
+    raw, stride = buf.raw, full_w * 4
+    data = bytearray(b"".join(
+        raw[row * stride + x * 4:row * stride + (x + width) * 4]
+        for row in range(y, y + height)))
+    # Some apps (games, video players) don't render this way and come back
+    # solid black.
+    if all(data[c::4].count(0) == width * height for c in range(3)):
+        return None
+    return ScreenShot.from_size(data, width, height)
 
 
 def list_windows():
@@ -333,6 +421,16 @@ class Stepper(threading.Thread):
             raise Stopped("The window is off-screen.")
         return {"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1}
 
+    def _grab(self, sct, target, bounds):
+        if IS_WIN and not self.whole_screen:
+            try:
+                shot = grab_window(target)
+            except Exception:
+                shot = None
+            if shot is not None:
+                return shot
+        return sct.grab(self._region(sct, bounds))
+
     def _do_action(self, bounds):
         kind, value = self.action
         if kind == "key":
@@ -397,8 +495,8 @@ class Stepper(threading.Thread):
                 except Exception:
                     pass  # keep the last known position
 
-                shot = sct.grab(self._region(sct, bounds))
-                digest = hashlib.blake2b(shot.raw, digest_size=16).digest()
+                shot = self._grab(sct, target, bounds)
+                digest = hashlib.blake2b(shot.rgb, digest_size=16).digest()
                 if digest == last_digest:
                     same_streak += 1
                 else:

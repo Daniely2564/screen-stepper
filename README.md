@@ -30,5 +30,6 @@ Screenshots go to `Pictures/Screen Stepper/<date time>/0001.png, 0002.png, …`.
 
 - **macOS:** the first run asks for **Screen Recording** and **Accessibility** (and possibly **Input Monitoring** for Esc). Allow them for Terminal (or for Screen Stepper.app if you built it) in System Settings → Privacy & Security, then restart the app. Black screenshots = Screen Recording isn't allowed yet.
 - **Windows:** if the target app runs as Administrator, run Screen Stepper as Administrator too, otherwise Windows blocks the key presses.
+- **Windows, "Just the window":** the app asks the window to draw itself, so popups, notifications or other windows on top of it don't end up in the shots. A few apps (some games and video players) can't be captured this way; for those it falls back to a normal screenshot of that part of the screen.
 - **It stopped right away with "another window became active":** something popped up over the app (a dialog, a notification). Close it and start again.
 - Esc is also delivered to the app you're capturing (e.g. it may leave full-screen mode). Clicking another window is the quieter way to stop.
